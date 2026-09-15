@@ -8,6 +8,11 @@
 <meta name="theme-color" content="#1f4e78">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+
 <style>
 :root{
   --azul: #1f4e78; --azul-claro: #eaf2f8; --rojo: #c0392b; --gris: #6b7280;
@@ -768,6 +773,110 @@ function evaluarReferencia(refDef, valor, edadAnios){
 
 </script>
 <script>
+/* ===================== CardioPed - sincronización con Firebase (Firestore) =====================
+   Diseño: la base local (IndexedDB) sigue siendo la fuente de verdad inmediata — la app
+   funciona igual sin conexión. Esta capa es un espejo: cuando hay internet, cada cambio local
+   se copia a Firestore, y cuando llega un cambio desde OTRO dispositivo, se copia hacia acá.
+   Si Firebase no carga (sin señal, o la primera vez sin haber tenido internet nunca), la app
+   sigue funcionando 100% local, solo que sin espejo hasta que haya conexión. */
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDKhxlYhxAEQPQvPFbEZe-xXQ1YCQYdrSU",
+  authDomain: "cardioped-40eb7.firebaseapp.com",
+  projectId: "cardioped-40eb7",
+  storageBucket: "cardioped-40eb7.firebasestorage.app",
+  messagingSenderId: "74860999541",
+  appId: "1:74860999541:web:ff00142083ffb773f6193c"
+};
+
+const COLECCIONES_SINCRONIZADAS = ['pacientes', 'medicos', 'referencias', 'usuarios'];
+
+let fbDb = null;
+let firebaseListo = false;
+let alRecibirCambioRemoto = null; // callback que la app registra para refrescar la pantalla
+
+function idParaFirestore(valor, coleccion){
+  // 'referencias' usa 'variable' como clave; el resto usa 'id'.
+  return coleccion==='referencias' ? String(valor.variable) : String(valor.id);
+}
+
+async function iniciarFirebase(onCambioRemoto){
+  alRecibirCambioRemoto = onCambioRemoto;
+  try{
+    if(typeof firebase === 'undefined') { console.warn('CardioPed: SDK de Firebase no cargó (¿sin internet?). Trabajando solo local.'); return false; }
+    firebase.initializeApp(firebaseConfig);
+    fbDb = firebase.firestore();
+    try{ await fbDb.enablePersistence({synchronizeTabs:true}); }
+    catch(e){ /* ya estaba habilitado en otra pestaña, o el navegador no lo soporta: no es grave */ }
+    await firebase.auth().signInAnonymously();
+    firebaseListo = true;
+    COLECCIONES_SINCRONIZADAS.forEach(escucharColeccionRemota);
+    console.info('CardioPed: sincronización con Firebase activa.');
+    return true;
+  }catch(e){
+    console.warn('CardioPed: no se pudo iniciar Firebase, trabajando solo local.', e);
+    firebaseListo = false;
+    return false;
+  }
+}
+
+function escucharColeccionRemota(coleccion){
+  fbDb.collection(coleccion).onSnapshot(
+    (snapshot)=>{
+      let huboCambio = false;
+      snapshot.docChanges().forEach((cambio)=>{
+        // Ignora el eco del cambio que ESTE dispositivo acaba de escribir hace un instante.
+        if(cambio.doc.metadata.hasPendingWrites) return;
+        huboCambio = true;
+        const datos = cambio.doc.data();
+        if(cambio.type==='removed'){
+          const clave = coleccion==='referencias' ? cambio.doc.id : (isNaN(Number(cambio.doc.id)) ? cambio.doc.id : Number(cambio.doc.id));
+          DB.delete(coleccion, clave).catch(()=>{});
+        }else{
+          if(coleccion!=='referencias'){
+            datos.id = isNaN(Number(cambio.doc.id)) ? cambio.doc.id : Number(cambio.doc.id);
+          }
+          DB.put(coleccion, datos).catch(()=>{});
+        }
+      });
+      if(huboCambio && alRecibirCambioRemoto) alRecibirCambioRemoto(coleccion);
+    },
+    (error)=>{ console.warn('CardioPed: error escuchando '+coleccion+' en Firestore.', error); }
+  );
+}
+
+async function espejarGuardado(coleccion, valor){
+  if(!firebaseListo) return;
+  try{
+    await fbDb.collection(coleccion).doc(idParaFirestore(valor, coleccion)).set(valor);
+  }catch(e){ console.warn('CardioPed: no se pudo sincronizar un cambio ('+coleccion+'). Se reintentará cuando la SDK reconecte.', e); }
+}
+async function espejarBorrado(coleccion, clave){
+  if(!firebaseListo) return;
+  try{ await fbDb.collection(coleccion).doc(String(clave)).delete(); }
+  catch(e){ console.warn('CardioPed: no se pudo sincronizar un borrado ('+coleccion+').', e); }
+}
+
+/* ---------- Migración inicial: subir lo que ya había en este dispositivo ---------- */
+async function migrarDatosLocalesAFirebaseSiCorresponde(){
+  if(!firebaseListo) return;
+  try{
+    const yaHayNube = await fbDb.collection('pacientes').limit(1).get();
+    if(!yaHayNube.empty) return; // la nube ya tiene datos; no pisar nada
+    const [pac, med, ref, usu] = await Promise.all([
+      DB.getAll('pacientes'), DB.getAll('medicos'), DB.getAll('referencias'), DB.getAll('usuarios')
+    ]);
+    if(pac.length===0 && med.length===0 && usu.length===0) return; // no hay nada local que subir
+    for(const p of pac) await espejarGuardado('pacientes', p);
+    for(const m of med) await espejarGuardado('medicos', m);
+    for(const r of ref) await espejarGuardado('referencias', r);
+    for(const u of usu) await espejarGuardado('usuarios', u);
+    console.info('CardioPed: datos locales existentes subidos a la nube por primera vez.');
+  }catch(e){ console.warn('CardioPed: no se pudo hacer la migración inicial a la nube.', e); }
+}
+
+</script>
+<script>
 /* ===================== CardioPed - lógica principal ===================== */
 
 const CAMPOS = [
@@ -839,6 +948,10 @@ function fmtFecha(iso){
   return `${d}/${m}/${y}`;
 }
 function soloDigitos(s){ return (s||'').replace(/\D/g,''); }
+function generarIdLocal(){
+  // Único incluso creado sin conexión en distintos dispositivos (no depende de un contador central).
+  return Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+}
 function numeroConPais(tel){
   if(!tel) return '';
   const d = soloDigitos(tel);
@@ -855,10 +968,10 @@ async function cargarTodo(){
   const cfgCodigo = await DB.get('config', 'codigo_pais');
   if(cfgCodigo) config.codigo_pais = cfgCodigo.valor;
 }
-async function guardarPaciente(p){ return DB.put('pacientes', p); }
-async function guardarMedico(m){ return DB.put('medicos', m); }
-async function guardarReferencia(r){ return DB.put('referencias', r); }
-async function guardarConfigClave(clave, valor){ return DB.put('config', {clave, valor}); }
+async function guardarPaciente(p){ const r = await DB.put('pacientes', p); espejarGuardado('pacientes', p); return r; }
+async function guardarMedico(m){ const r = await DB.put('medicos', m); espejarGuardado('medicos', m); return r; }
+async function guardarReferencia(r0){ const r = await DB.put('referencias', r0); espejarGuardado('referencias', r0); return r; }
+async function guardarConfigClave(clave, valor){ const r = await DB.put('config', {clave, valor}); return r; }
 
 /* ---------- SEMILLA (copia compartida) ---------- */
 async function importarSemillaSiCorresponde(){
@@ -897,7 +1010,10 @@ async function migrarUsuarioAntiguoSiCorresponde(){
   try{
     const auth = JSON.parse(legado);
     if(auth && auth.user && auth.hash){
-      await DB.put('usuarios', {usuario: auth.user, hash: auth.hash, rol:'administrador', fecha_creacion: new Date().toISOString().slice(0,10)});
+      const registro = {usuario: auth.user, hash: auth.hash, rol:'administrador', fecha_creacion: new Date().toISOString().slice(0,10)};
+      const id = await DB.put('usuarios', registro);
+      registro.id = id;
+      espejarGuardado('usuarios', registro);
       localStorage.removeItem(LS_AUTH_LEGACY);
     }
   }catch(e){ /* ignora si el formato antiguo no es válido */ }
@@ -905,11 +1021,46 @@ async function migrarUsuarioAntiguoSiCorresponde(){
 async function iniciarAuth(){
   await importarSemillaSiCorresponde();
   await migrarUsuarioAntiguoSiCorresponde();
-  const usuariosDB = await DB.getAll('usuarios');
+
+  // Intenta conectar con Firebase en paralelo; si no hay internet, la app sigue local sin bloquear.
+  iniciarFirebase(alRecibirCambioRemotoUI).then(async (ok)=>{
+    if(ok) await migrarDatosLocalesAFirebaseSiCorresponde();
+  });
+
+  let usuariosDB = await DB.getAll('usuarios');
+  if(usuariosDB.length===0){
+    // Dispositivo nuevo sin cuentas locales: espera un poco por si la nube ya tiene usuarios,
+    // para no crear una cuenta de administrador "de más" quien ya tiene equipo configurado.
+    usuariosDB = await esperarPosiblesUsuariosRemotos();
+  }
   const sesion = sesionActual();
-  if(sesion && usuariosDB.some(u=>u.id===sesion.id)){ iniciarApp(); return; }
+  if(sesion && usuariosDB.some(u=>String(u.id)===String(sesion.id))){ iniciarApp(); return; }
   if(sesion){ sessionStorage.removeItem(SS_SESION); } // el usuario de la sesión ya no existe
   mostrarPantalla(usuariosDB.length===0 ? 'pantalla-configurar' : 'pantalla-login');
+}
+async function esperarPosiblesUsuariosRemotos(){
+  const maxEspera = 4000, paso = 300;
+  let transcurrido = 0;
+  while(transcurrido < maxEspera){
+    await new Promise(r=>setTimeout(r, paso));
+    transcurrido += paso;
+    const usuariosDB = await DB.getAll('usuarios');
+    if(usuariosDB.length>0) return usuariosDB;
+  }
+  return await DB.getAll('usuarios');
+}
+async function alRecibirCambioRemotoUI(coleccion){
+  if(!sesionActual()) return; // todavía no se ha iniciado sesión en esta pantalla
+  if(coleccion==='pacientes'){ pacientes = await DB.getAll('pacientes'); render(); }
+  else if(coleccion==='medicos'){
+    medicos = await DB.getAll('medicos');
+    if($('#overlay-medicos').classList.contains('abierto')) renderListaMedicos();
+  }else if(coleccion==='referencias'){
+    referenciasCustom = await DB.getAll('referencias');
+    if($('#overlay-referencias').classList.contains('abierto')) renderTablaReferencias();
+  }else if(coleccion==='usuarios'){
+    if($('#overlay-usuarios').classList.contains('abierto')) renderListaUsuarios();
+  }
 }
 $('#form-configurar').addEventListener('submit', async (e)=>{
   e.preventDefault();
@@ -919,7 +1070,10 @@ $('#form-configurar').addEventListener('submit', async (e)=>{
   if(!user || p1.length<4){ err.textContent='Escribe un usuario y una contraseña de al menos 4 caracteres.'; return; }
   if(p1!==p2){ err.textContent='Las contraseñas no coinciden.'; return; }
   const hash = await sha256(user.toLowerCase()+'::'+p1);
-  const id = await DB.put('usuarios', {usuario:user, hash, rol:'administrador', fecha_creacion:new Date().toISOString().slice(0,10)});
+  const registro = {usuario:user, hash, rol:'administrador', fecha_creacion:new Date().toISOString().slice(0,10)};
+  const id = await DB.put('usuarios', registro);
+  registro.id = id;
+  espejarGuardado('usuarios', registro);
   sessionStorage.setItem(SS_SESION, JSON.stringify({id, usuario:user, rol:'administrador'}));
   iniciarApp();
 });
@@ -962,8 +1116,8 @@ async function renderListaUsuarios(){
     <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #eee;">
       <div><strong>${u.usuario}</strong> ${u.id===sesion.id?'<span class="nota">(tú)</span>':''}<br><span class="nota">${ROLES[u.rol]?.etiqueta || u.rol}</span></div>
       <div class="acciones">
-        <button class="btn btn-gris btn-sm" onclick="restablecerPasswordUsuario(${u.id})">Restablecer contraseña</button>
-        ${u.id!==sesion.id ? `<button class="btn btn-rojo btn-sm" onclick="borrarUsuario(${u.id})">Eliminar</button>` : ''}
+        <button class="btn btn-gris btn-sm" onclick="restablecerPasswordUsuario('${u.id}')">Restablecer contraseña</button>
+        ${u.id!==sesion.id ? `<button class="btn btn-rojo btn-sm" onclick="borrarUsuario('${u.id}')">Eliminar</button>` : ''}
       </div>
     </div>`).join('');
 }
@@ -975,16 +1129,18 @@ async function restablecerPasswordUsuario(id){
   const u = await DB.get('usuarios', id);
   u.hash = await sha256(u.usuario.toLowerCase()+'::'+nueva);
   await DB.put('usuarios', u);
+  espejarGuardado('usuarios', u);
   alert('Contraseña actualizada.');
 }
 async function borrarUsuario(id){
   if(!permisoActual('gestionar_usuarios')){ alert('No tienes permiso para realizar esta acción.'); return; }
   const usuariosDB = await DB.getAll('usuarios');
-  const u = usuariosDB.find(x=>x.id===id);
+  const u = usuariosDB.find(x=>String(x.id)===String(id));
   const admins = usuariosDB.filter(x=>x.rol==='administrador');
   if(u.rol==='administrador' && admins.length<=1){ alert('No puedes eliminar al único administrador.'); return; }
   if(!confirm(`¿Eliminar el acceso de "${u.usuario}"?`)) return;
   await DB.delete('usuarios', id);
+  espejarBorrado('usuarios', id);
   renderListaUsuarios();
 }
 $('#form-usuario').addEventListener('submit', async (e)=>{
@@ -997,7 +1153,10 @@ $('#form-usuario').addEventListener('submit', async (e)=>{
   const usuariosDB = await DB.getAll('usuarios');
   if(usuariosDB.some(u=>u.usuario.toLowerCase()===user.toLowerCase())){ err.textContent='Ya existe un usuario con ese nombre.'; return; }
   const hash = await sha256(user.toLowerCase()+'::'+pass);
-  await DB.put('usuarios', {usuario:user, hash, rol, fecha_creacion:new Date().toISOString().slice(0,10)});
+  const registro = {usuario:user, hash, rol, fecha_creacion:new Date().toISOString().slice(0,10)};
+  const id = await DB.put('usuarios', registro);
+  registro.id = id;
+  espejarGuardado('usuarios', registro);
   $('#form-usuario').reset();
   renderListaUsuarios();
 });
@@ -1071,7 +1230,7 @@ function abrirModal(id=null){
   construirFormulario();
   $('#foto-preview').src = '';
   if(id){
-    const p = pacientes.find(x=>x.id===id);
+    const p = pacientes.find(x=>String(x.id)===String(id));
     $('#modal-titulo').textContent = 'Editar paciente';
     CAMPOS.forEach(c=>{ if($('#campo-'+c.k)) $('#campo-'+c.k).value = p[c.k]||''; });
     $('#campo-edad').value = calcEdad(p.fecha_nac);
@@ -1097,16 +1256,16 @@ $('#form-paciente').addEventListener('submit', async (e)=>{
   if(fotoBase64) datos.foto = fotoBase64;
 
   if(editandoId){
-    const idx = pacientes.findIndex(x=>x.id===editandoId);
+    const idx = pacientes.findIndex(x=>String(x.id)===String(editandoId));
     pacientes[idx] = {...pacientes[idx], ...datos};
     await guardarPaciente(pacientes[idx]);
   }else{
+    datos.id = generarIdLocal();
     datos.estado = 'activo';
     datos.ecos = [];
     datos.fecha_registro = new Date().toISOString().slice(0,10);
     datos.origen = 'Registrado en CardioPed';
-    const id = await guardarPaciente(datos);
-    datos.id = id;
+    await guardarPaciente(datos);
     pacientes.push(datos);
   }
   cerrarModal();
@@ -1116,7 +1275,7 @@ $('#form-paciente').addEventListener('submit', async (e)=>{
 /* ---------- ESTADOS: ALTA / FALLECIDO / ELIMINAR / RESTAURAR ---------- */
 async function cambiarEstado(id, estado){
   if(!permisoActual('crear_editar')){ alert('No tienes permiso para realizar esta acción.'); return; }
-  const p = pacientes.find(x=>x.id===id);
+  const p = pacientes.find(x=>String(x.id)===String(id));
   if(!p) return;
   if(estado==='fallecido'){
     const fecha = prompt('Fecha de fallecimiento (AAAA-MM-DD):', new Date().toISOString().slice(0,10));
@@ -1132,7 +1291,8 @@ async function eliminarDefinitivo(id){
   if(!permisoActual('eliminar_definitivo')){ alert('No tienes permiso para realizar esta acción.'); return; }
   if(!confirm('Esto elimina el registro PARA SIEMPRE, sin poder recuperarlo. ¿Continuar?')) return;
   await DB.delete('pacientes', id);
-  pacientes = pacientes.filter(x=>x.id!==id);
+  espejarBorrado('pacientes', id);
+  pacientes = pacientes.filter(x=>String(x.id)!==String(id));
   render();
 }
 
@@ -1153,7 +1313,7 @@ $('#btn-fusionar').addEventListener('click', ()=>{
 });
 let fusionPar = null;
 function abrirModalFusion(id1, id2){
-  const p1 = pacientes.find(x=>x.id===id1), p2 = pacientes.find(x=>x.id===id2);
+  const p1 = pacientes.find(x=>String(x.id)===String(id1)), p2 = pacientes.find(x=>String(x.id)===String(id2));
   fusionPar = {p1, p2};
   const camposFusion = CAMPOS.filter(c=>c.tipo!=='select-medico').map(c=>c.k).concat(['telefono']);
   const cont = $('#cuerpo-fusion');
@@ -1194,7 +1354,7 @@ $('#btn-confirmar-fusion').addEventListener('click', async ()=>{
   p2.fecha_estado = new Date().toISOString().slice(0,10);
   p2.origen = (p2.origen||'') + ` — fusionado con "${p1.nombre}" (registro #${p1.id})`;
   await guardarPaciente(p2);
-  const idx1 = pacientes.findIndex(x=>x.id===p1.id);
+  const idx1 = pacientes.findIndex(x=>String(x.id)===String(p1.id));
   pacientes[idx1] = resultado;
   seleccionFusion.clear();
   actualizarBotonFusion();
@@ -1274,20 +1434,20 @@ function accionesFila(p){
   }
   const puedeEditar = permisoActual('crear_editar');
   const puedeEliminarDef = permisoActual('eliminar_definitivo');
-  let acciones = `${puedeEditar?`<button class="btn btn-gris btn-sm" onclick="abrirModal(${p.id})">Editar</button>`:''}
-    <button class="btn btn-primary btn-sm" onclick="abrirEcos(${p.id})">Eco</button>
-    <button class="btn btn-gris btn-sm" onclick="generarFicha(${p.id})">Ficha</button>
-    <button class="btn btn-gris btn-sm" onclick="compartirFicha(${p.id})">Compartir</button>`;
+  let acciones = `${puedeEditar?`<button class="btn btn-gris btn-sm" onclick="abrirModal('${p.id}')">Editar</button>`:''}
+    <button class="btn btn-primary btn-sm" onclick="abrirEcos('${p.id}')">Eco</button>
+    <button class="btn btn-gris btn-sm" onclick="generarFicha('${p.id}')">Ficha</button>
+    <button class="btn btn-gris btn-sm" onclick="compartirFicha('${p.id}')">Compartir</button>`;
   if(!puedeEditar) return {contacto, acciones};
   if((p.estado||'activo')==='activo'){
-    acciones += `<button class="btn btn-verde btn-sm" onclick="cambiarEstado(${p.id},'alta')">Alta</button>
-      <button class="btn btn-rojo btn-sm" onclick="cambiarEstado(${p.id},'fallecido')">Fallecido</button>
-      <button class="btn btn-rojo btn-sm" onclick="cambiarEstado(${p.id},'eliminado')">Eliminar</button>`;
+    acciones += `<button class="btn btn-verde btn-sm" onclick="cambiarEstado('${p.id}','alta')">Alta</button>
+      <button class="btn btn-rojo btn-sm" onclick="cambiarEstado('${p.id}','fallecido')">Fallecido</button>
+      <button class="btn btn-rojo btn-sm" onclick="cambiarEstado('${p.id}','eliminado')">Eliminar</button>`;
   }else if(p.estado==='eliminado'){
-    acciones += `<button class="btn btn-verde btn-sm" onclick="cambiarEstado(${p.id},'activo')">Restaurar</button>
-      ${puedeEliminarDef?`<button class="btn btn-rojo btn-sm" onclick="eliminarDefinitivo(${p.id})">Eliminar definitivo</button>`:''}`;
+    acciones += `<button class="btn btn-verde btn-sm" onclick="cambiarEstado('${p.id}','activo')">Restaurar</button>
+      ${puedeEliminarDef?`<button class="btn btn-rojo btn-sm" onclick="eliminarDefinitivo('${p.id}')">Eliminar definitivo</button>`:''}`;
   }else{
-    acciones += `<button class="btn btn-gris btn-sm" onclick="cambiarEstado(${p.id},'activo')">Reactivar</button>`;
+    acciones += `<button class="btn btn-gris btn-sm" onclick="cambiarEstado('${p.id}','activo')">Reactivar</button>`;
   }
   return {contacto, acciones};
 }
@@ -1314,7 +1474,7 @@ function renderTabla(){
     const tr = document.createElement('tr');
     const fotoHtml = p.foto ? `<img class="foto-mini" src="${p.foto}">` : `<div class="foto-mini vacia">🧒</div>`;
     tr.innerHTML = `
-      <td data-label=""><input type="checkbox" class="chk-fusion" data-id="${p.id}" ${seleccionFusion.has(p.id)?'checked':''}></td>
+      <td data-label=""><input type="checkbox" class="chk-fusion" data-id="${p.id}" ${seleccionFusion.has(String(p.id))?'checked':''}></td>
       <td data-label="Foto">${fotoHtml}</td>
       <td data-label="Nombre">${p.nombre||''}</td>
       <td data-label="Sexo">${(p.sexo||'').toUpperCase()}</td>
@@ -1328,7 +1488,7 @@ function renderTabla(){
     cuerpo.appendChild(tr);
   });
   $all('.chk-fusion').forEach(chk=>{
-    chk.addEventListener('change', ()=> toggleSeleccionFusion(parseInt(chk.dataset.id,10), chk.checked));
+    chk.addEventListener('change', ()=> toggleSeleccionFusion(chk.dataset.id, chk.checked));
   });
   $('#contador-resultados').textContent = lista.length + (lista.length===1?' paciente':' pacientes');
 }
@@ -1355,7 +1515,7 @@ function textoFicha(p){
   return filas.filter(f=>f[1]).map(f=>`${f[0]}: ${f[1]}`).join('\n');
 }
 function generarFicha(id){
-  const p = pacientes.find(x=>x.id===id);
+  const p = pacientes.find(x=>String(x.id)===String(id));
   const filas = textoFicha(p).split('\n').map(l=>{
     const [k,...rest] = l.split(': '); return [k, rest.join(': ')];
   });
@@ -1368,7 +1528,7 @@ function generarFicha(id){
   window.print();
 }
 function compartirFicha(id){
-  const p = pacientes.find(x=>x.id===id);
+  const p = pacientes.find(x=>String(x.id)===String(id));
   const texto = `Ficha del paciente — CardioPed\n\n${textoFicha(p)}`;
   if(navigator.share){
     navigator.share({title:'Ficha del paciente', text: texto}).catch(()=>{});
@@ -1386,7 +1546,7 @@ function compartirFicha(id){
 /* ---------- ECOCARDIOGRAMAS ---------- */
 function abrirEcos(id){
   ecoPacienteId = id;
-  const p = pacientes.find(x=>x.id===id);
+  const p = pacientes.find(x=>String(x.id)===String(id));
   $('#ecos-titulo').textContent = 'Ecocardiogramas — ' + p.nombre;
   $('#form-eco-cont').classList.add('oculto');
   $('#btn-nuevo-eco').classList.toggle('oculto', !permisoActual('crear_editar'));
@@ -1397,7 +1557,7 @@ $('#btn-cerrar-ecos').addEventListener('click', ()=>$('#overlay-ecos').classList
 $('#btn-cerrar-ecos2').addEventListener('click', ()=>$('#overlay-ecos').classList.remove('abierto'));
 
 function renderListaEcos(){
-  const p = pacientes.find(x=>x.id===ecoPacienteId);
+  const p = pacientes.find(x=>String(x.id)===String(ecoPacienteId));
   const cont = $('#lista-ecos');
   const ecos = (p.ecos||[]).slice().sort((a,b)=> (b.fecha_eco||'').localeCompare(a.fecha_eco||''));
   if(ecos.length===0){ cont.innerHTML = '<p class="nota">Aún no hay estudios registrados.</p>'; return; }
@@ -1419,13 +1579,13 @@ function renderListaEcos(){
 async function borrarEco(idx){
   if(!permisoActual('crear_editar')){ alert('No tienes permiso para realizar esta acción.'); return; }
   if(!confirm('¿Eliminar este estudio de ecocardiograma?')) return;
-  const p = pacientes.find(x=>x.id===ecoPacienteId);
+  const p = pacientes.find(x=>String(x.id)===String(ecoPacienteId));
   p.ecos.splice(idx,1);
   await guardarPaciente(p);
   renderListaEcos();
 }
 function verEco(idx){
-  const p = pacientes.find(x=>x.id===ecoPacienteId);
+  const p = pacientes.find(x=>String(x.id)===String(ecoPacienteId));
   abrirFormEco(p.ecos[idx], idx);
 }
 $('#btn-nuevo-eco').addEventListener('click', ()=>{
@@ -1466,7 +1626,7 @@ function leerValorCampoEco(c){
   return el ? el.value : '';
 }
 function abrirFormEco(ecoExistente, idx){
-  const p = pacientes.find(x=>x.id===ecoPacienteId);
+  const p = pacientes.find(x=>String(x.id)===String(ecoPacienteId));
   const cont = $('#form-eco-cont');
   let html = `<form id="form-eco">`;
   CAMPOS_ECO.forEach(grupo=>{
@@ -1584,14 +1744,15 @@ function renderListaMedicos(){
   cont.innerHTML = medicos.map(m=>`
     <div style="display:flex; justify-content:space-between; align-items:center; padding:7px 0; border-bottom:1px solid #eee;">
       <div><strong>${m.nombre}</strong><br><span class="nota">${m.correo||''}</span></div>
-      <button class="btn btn-rojo btn-sm" onclick="borrarMedico(${m.id})">Eliminar</button>
+      <button class="btn btn-rojo btn-sm" onclick="borrarMedico('${m.id}')">Eliminar</button>
     </div>`).join('');
 }
 async function borrarMedico(id){
   if(!permisoActual('gestionar_medicos')){ alert('No tienes permiso para realizar esta acción.'); return; }
   if(!confirm('¿Eliminar este médico?')) return;
   await DB.delete('medicos', id);
-  medicos = medicos.filter(m=>m.id!==id);
+  espejarBorrado('medicos', id);
+  medicos = medicos.filter(m=>String(m.id)!==String(id));
   renderListaMedicos();
 }
 $('#form-medico').addEventListener('submit', async (e)=>{
@@ -1628,6 +1789,7 @@ function renderTablaReferencias(){
 async function borrarReferenciaCustom(variable){
   if(!permisoActual('gestionar_referencias')){ alert('No tienes permiso para realizar esta acción.'); return; }
   await DB.delete('referencias', variable);
+  espejarBorrado('referencias', variable);
   referenciasCustom = referenciasCustom.filter(r=>r.variable!==variable);
   renderTablaReferencias();
 }
@@ -1699,12 +1861,12 @@ $('#input-importar').addEventListener('change', (e)=>{
         }
       });
       if(!p.nombre) continue;
+      p.id = generarIdLocal();
       p.estado = p.fallecido_original==='Sí' ? 'fallecido' : 'activo';
       p.ecos = [];
       p.fecha_registro = new Date().toISOString().slice(0,10);
       p.origen = p.origen || ('Importado de ' + file.name);
-      const id = await guardarPaciente(p);
-      p.id = id;
+      await guardarPaciente(p);
       pacientes.push(p);
       importados++;
     }
@@ -1779,6 +1941,11 @@ const APP_TEMPLATE = `<!DOCTYPE html>
 <meta name="theme-color" content="#1f4e78">
 <link rel="icon" href="icon-192.png">
 <link rel="apple-touch-icon" href="icon-192.png">
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"><\/script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"><\/script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"><\/script>
+
 <style>
 :root{
   --azul: #1f4e78; --azul-claro: #eaf2f8; --rojo: #c0392b; --gris: #6b7280;
@@ -2539,6 +2706,110 @@ function evaluarReferencia(refDef, valor, edadAnios){
 
 <\/script>
 <script>
+/* ===================== CardioPed - sincronización con Firebase (Firestore) =====================
+   Diseño: la base local (IndexedDB) sigue siendo la fuente de verdad inmediata — la app
+   funciona igual sin conexión. Esta capa es un espejo: cuando hay internet, cada cambio local
+   se copia a Firestore, y cuando llega un cambio desde OTRO dispositivo, se copia hacia acá.
+   Si Firebase no carga (sin señal, o la primera vez sin haber tenido internet nunca), la app
+   sigue funcionando 100% local, solo que sin espejo hasta que haya conexión. */
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDKhxlYhxAEQPQvPFbEZe-xXQ1YCQYdrSU",
+  authDomain: "cardioped-40eb7.firebaseapp.com",
+  projectId: "cardioped-40eb7",
+  storageBucket: "cardioped-40eb7.firebasestorage.app",
+  messagingSenderId: "74860999541",
+  appId: "1:74860999541:web:ff00142083ffb773f6193c"
+};
+
+const COLECCIONES_SINCRONIZADAS = ['pacientes', 'medicos', 'referencias', 'usuarios'];
+
+let fbDb = null;
+let firebaseListo = false;
+let alRecibirCambioRemoto = null; // callback que la app registra para refrescar la pantalla
+
+function idParaFirestore(valor, coleccion){
+  // 'referencias' usa 'variable' como clave; el resto usa 'id'.
+  return coleccion==='referencias' ? String(valor.variable) : String(valor.id);
+}
+
+async function iniciarFirebase(onCambioRemoto){
+  alRecibirCambioRemoto = onCambioRemoto;
+  try{
+    if(typeof firebase === 'undefined') { console.warn('CardioPed: SDK de Firebase no cargó (¿sin internet?). Trabajando solo local.'); return false; }
+    firebase.initializeApp(firebaseConfig);
+    fbDb = firebase.firestore();
+    try{ await fbDb.enablePersistence({synchronizeTabs:true}); }
+    catch(e){ /* ya estaba habilitado en otra pestaña, o el navegador no lo soporta: no es grave */ }
+    await firebase.auth().signInAnonymously();
+    firebaseListo = true;
+    COLECCIONES_SINCRONIZADAS.forEach(escucharColeccionRemota);
+    console.info('CardioPed: sincronización con Firebase activa.');
+    return true;
+  }catch(e){
+    console.warn('CardioPed: no se pudo iniciar Firebase, trabajando solo local.', e);
+    firebaseListo = false;
+    return false;
+  }
+}
+
+function escucharColeccionRemota(coleccion){
+  fbDb.collection(coleccion).onSnapshot(
+    (snapshot)=>{
+      let huboCambio = false;
+      snapshot.docChanges().forEach((cambio)=>{
+        // Ignora el eco del cambio que ESTE dispositivo acaba de escribir hace un instante.
+        if(cambio.doc.metadata.hasPendingWrites) return;
+        huboCambio = true;
+        const datos = cambio.doc.data();
+        if(cambio.type==='removed'){
+          const clave = coleccion==='referencias' ? cambio.doc.id : (isNaN(Number(cambio.doc.id)) ? cambio.doc.id : Number(cambio.doc.id));
+          DB.delete(coleccion, clave).catch(()=>{});
+        }else{
+          if(coleccion!=='referencias'){
+            datos.id = isNaN(Number(cambio.doc.id)) ? cambio.doc.id : Number(cambio.doc.id);
+          }
+          DB.put(coleccion, datos).catch(()=>{});
+        }
+      });
+      if(huboCambio && alRecibirCambioRemoto) alRecibirCambioRemoto(coleccion);
+    },
+    (error)=>{ console.warn('CardioPed: error escuchando '+coleccion+' en Firestore.', error); }
+  );
+}
+
+async function espejarGuardado(coleccion, valor){
+  if(!firebaseListo) return;
+  try{
+    await fbDb.collection(coleccion).doc(idParaFirestore(valor, coleccion)).set(valor);
+  }catch(e){ console.warn('CardioPed: no se pudo sincronizar un cambio ('+coleccion+'). Se reintentará cuando la SDK reconecte.', e); }
+}
+async function espejarBorrado(coleccion, clave){
+  if(!firebaseListo) return;
+  try{ await fbDb.collection(coleccion).doc(String(clave)).delete(); }
+  catch(e){ console.warn('CardioPed: no se pudo sincronizar un borrado ('+coleccion+').', e); }
+}
+
+/* ---------- Migración inicial: subir lo que ya había en este dispositivo ---------- */
+async function migrarDatosLocalesAFirebaseSiCorresponde(){
+  if(!firebaseListo) return;
+  try{
+    const yaHayNube = await fbDb.collection('pacientes').limit(1).get();
+    if(!yaHayNube.empty) return; // la nube ya tiene datos; no pisar nada
+    const [pac, med, ref, usu] = await Promise.all([
+      DB.getAll('pacientes'), DB.getAll('medicos'), DB.getAll('referencias'), DB.getAll('usuarios')
+    ]);
+    if(pac.length===0 && med.length===0 && usu.length===0) return; // no hay nada local que subir
+    for(const p of pac) await espejarGuardado('pacientes', p);
+    for(const m of med) await espejarGuardado('medicos', m);
+    for(const r of ref) await espejarGuardado('referencias', r);
+    for(const u of usu) await espejarGuardado('usuarios', u);
+    console.info('CardioPed: datos locales existentes subidos a la nube por primera vez.');
+  }catch(e){ console.warn('CardioPed: no se pudo hacer la migración inicial a la nube.', e); }
+}
+
+<\/script>
+<script>
 /* ===================== CardioPed - lógica principal ===================== */
 
 const CAMPOS = [
@@ -2610,6 +2881,10 @@ function fmtFecha(iso){
   return \`\${d}/\${m}/\${y}\`;
 }
 function soloDigitos(s){ return (s||'').replace(/\\D/g,''); }
+function generarIdLocal(){
+  // Único incluso creado sin conexión en distintos dispositivos (no depende de un contador central).
+  return Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+}
 function numeroConPais(tel){
   if(!tel) return '';
   const d = soloDigitos(tel);
@@ -2626,10 +2901,10 @@ async function cargarTodo(){
   const cfgCodigo = await DB.get('config', 'codigo_pais');
   if(cfgCodigo) config.codigo_pais = cfgCodigo.valor;
 }
-async function guardarPaciente(p){ return DB.put('pacientes', p); }
-async function guardarMedico(m){ return DB.put('medicos', m); }
-async function guardarReferencia(r){ return DB.put('referencias', r); }
-async function guardarConfigClave(clave, valor){ return DB.put('config', {clave, valor}); }
+async function guardarPaciente(p){ const r = await DB.put('pacientes', p); espejarGuardado('pacientes', p); return r; }
+async function guardarMedico(m){ const r = await DB.put('medicos', m); espejarGuardado('medicos', m); return r; }
+async function guardarReferencia(r0){ const r = await DB.put('referencias', r0); espejarGuardado('referencias', r0); return r; }
+async function guardarConfigClave(clave, valor){ const r = await DB.put('config', {clave, valor}); return r; }
 
 /* ---------- SEMILLA (copia compartida) ---------- */
 async function importarSemillaSiCorresponde(){
@@ -2668,7 +2943,10 @@ async function migrarUsuarioAntiguoSiCorresponde(){
   try{
     const auth = JSON.parse(legado);
     if(auth && auth.user && auth.hash){
-      await DB.put('usuarios', {usuario: auth.user, hash: auth.hash, rol:'administrador', fecha_creacion: new Date().toISOString().slice(0,10)});
+      const registro = {usuario: auth.user, hash: auth.hash, rol:'administrador', fecha_creacion: new Date().toISOString().slice(0,10)};
+      const id = await DB.put('usuarios', registro);
+      registro.id = id;
+      espejarGuardado('usuarios', registro);
       localStorage.removeItem(LS_AUTH_LEGACY);
     }
   }catch(e){ /* ignora si el formato antiguo no es válido */ }
@@ -2676,11 +2954,46 @@ async function migrarUsuarioAntiguoSiCorresponde(){
 async function iniciarAuth(){
   await importarSemillaSiCorresponde();
   await migrarUsuarioAntiguoSiCorresponde();
-  const usuariosDB = await DB.getAll('usuarios');
+
+  // Intenta conectar con Firebase en paralelo; si no hay internet, la app sigue local sin bloquear.
+  iniciarFirebase(alRecibirCambioRemotoUI).then(async (ok)=>{
+    if(ok) await migrarDatosLocalesAFirebaseSiCorresponde();
+  });
+
+  let usuariosDB = await DB.getAll('usuarios');
+  if(usuariosDB.length===0){
+    // Dispositivo nuevo sin cuentas locales: espera un poco por si la nube ya tiene usuarios,
+    // para no crear una cuenta de administrador "de más" quien ya tiene equipo configurado.
+    usuariosDB = await esperarPosiblesUsuariosRemotos();
+  }
   const sesion = sesionActual();
-  if(sesion && usuariosDB.some(u=>u.id===sesion.id)){ iniciarApp(); return; }
+  if(sesion && usuariosDB.some(u=>String(u.id)===String(sesion.id))){ iniciarApp(); return; }
   if(sesion){ sessionStorage.removeItem(SS_SESION); } // el usuario de la sesión ya no existe
   mostrarPantalla(usuariosDB.length===0 ? 'pantalla-configurar' : 'pantalla-login');
+}
+async function esperarPosiblesUsuariosRemotos(){
+  const maxEspera = 4000, paso = 300;
+  let transcurrido = 0;
+  while(transcurrido < maxEspera){
+    await new Promise(r=>setTimeout(r, paso));
+    transcurrido += paso;
+    const usuariosDB = await DB.getAll('usuarios');
+    if(usuariosDB.length>0) return usuariosDB;
+  }
+  return await DB.getAll('usuarios');
+}
+async function alRecibirCambioRemotoUI(coleccion){
+  if(!sesionActual()) return; // todavía no se ha iniciado sesión en esta pantalla
+  if(coleccion==='pacientes'){ pacientes = await DB.getAll('pacientes'); render(); }
+  else if(coleccion==='medicos'){
+    medicos = await DB.getAll('medicos');
+    if($('#overlay-medicos').classList.contains('abierto')) renderListaMedicos();
+  }else if(coleccion==='referencias'){
+    referenciasCustom = await DB.getAll('referencias');
+    if($('#overlay-referencias').classList.contains('abierto')) renderTablaReferencias();
+  }else if(coleccion==='usuarios'){
+    if($('#overlay-usuarios').classList.contains('abierto')) renderListaUsuarios();
+  }
 }
 $('#form-configurar').addEventListener('submit', async (e)=>{
   e.preventDefault();
@@ -2690,7 +3003,10 @@ $('#form-configurar').addEventListener('submit', async (e)=>{
   if(!user || p1.length<4){ err.textContent='Escribe un usuario y una contraseña de al menos 4 caracteres.'; return; }
   if(p1!==p2){ err.textContent='Las contraseñas no coinciden.'; return; }
   const hash = await sha256(user.toLowerCase()+'::'+p1);
-  const id = await DB.put('usuarios', {usuario:user, hash, rol:'administrador', fecha_creacion:new Date().toISOString().slice(0,10)});
+  const registro = {usuario:user, hash, rol:'administrador', fecha_creacion:new Date().toISOString().slice(0,10)};
+  const id = await DB.put('usuarios', registro);
+  registro.id = id;
+  espejarGuardado('usuarios', registro);
   sessionStorage.setItem(SS_SESION, JSON.stringify({id, usuario:user, rol:'administrador'}));
   iniciarApp();
 });
@@ -2733,8 +3049,8 @@ async function renderListaUsuarios(){
     <div style="display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #eee;">
       <div><strong>\${u.usuario}</strong> \${u.id===sesion.id?'<span class="nota">(tú)</span>':''}<br><span class="nota">\${ROLES[u.rol]?.etiqueta || u.rol}</span></div>
       <div class="acciones">
-        <button class="btn btn-gris btn-sm" onclick="restablecerPasswordUsuario(\${u.id})">Restablecer contraseña</button>
-        \${u.id!==sesion.id ? \`<button class="btn btn-rojo btn-sm" onclick="borrarUsuario(\${u.id})">Eliminar</button>\` : ''}
+        <button class="btn btn-gris btn-sm" onclick="restablecerPasswordUsuario('\${u.id}')">Restablecer contraseña</button>
+        \${u.id!==sesion.id ? \`<button class="btn btn-rojo btn-sm" onclick="borrarUsuario('\${u.id}')">Eliminar</button>\` : ''}
       </div>
     </div>\`).join('');
 }
@@ -2746,16 +3062,18 @@ async function restablecerPasswordUsuario(id){
   const u = await DB.get('usuarios', id);
   u.hash = await sha256(u.usuario.toLowerCase()+'::'+nueva);
   await DB.put('usuarios', u);
+  espejarGuardado('usuarios', u);
   alert('Contraseña actualizada.');
 }
 async function borrarUsuario(id){
   if(!permisoActual('gestionar_usuarios')){ alert('No tienes permiso para realizar esta acción.'); return; }
   const usuariosDB = await DB.getAll('usuarios');
-  const u = usuariosDB.find(x=>x.id===id);
+  const u = usuariosDB.find(x=>String(x.id)===String(id));
   const admins = usuariosDB.filter(x=>x.rol==='administrador');
   if(u.rol==='administrador' && admins.length<=1){ alert('No puedes eliminar al único administrador.'); return; }
   if(!confirm(\`¿Eliminar el acceso de "\${u.usuario}"?\`)) return;
   await DB.delete('usuarios', id);
+  espejarBorrado('usuarios', id);
   renderListaUsuarios();
 }
 $('#form-usuario').addEventListener('submit', async (e)=>{
@@ -2768,7 +3086,10 @@ $('#form-usuario').addEventListener('submit', async (e)=>{
   const usuariosDB = await DB.getAll('usuarios');
   if(usuariosDB.some(u=>u.usuario.toLowerCase()===user.toLowerCase())){ err.textContent='Ya existe un usuario con ese nombre.'; return; }
   const hash = await sha256(user.toLowerCase()+'::'+pass);
-  await DB.put('usuarios', {usuario:user, hash, rol, fecha_creacion:new Date().toISOString().slice(0,10)});
+  const registro = {usuario:user, hash, rol, fecha_creacion:new Date().toISOString().slice(0,10)};
+  const id = await DB.put('usuarios', registro);
+  registro.id = id;
+  espejarGuardado('usuarios', registro);
   $('#form-usuario').reset();
   renderListaUsuarios();
 });
@@ -2842,7 +3163,7 @@ function abrirModal(id=null){
   construirFormulario();
   $('#foto-preview').src = '';
   if(id){
-    const p = pacientes.find(x=>x.id===id);
+    const p = pacientes.find(x=>String(x.id)===String(id));
     $('#modal-titulo').textContent = 'Editar paciente';
     CAMPOS.forEach(c=>{ if($('#campo-'+c.k)) $('#campo-'+c.k).value = p[c.k]||''; });
     $('#campo-edad').value = calcEdad(p.fecha_nac);
@@ -2868,16 +3189,16 @@ $('#form-paciente').addEventListener('submit', async (e)=>{
   if(fotoBase64) datos.foto = fotoBase64;
 
   if(editandoId){
-    const idx = pacientes.findIndex(x=>x.id===editandoId);
+    const idx = pacientes.findIndex(x=>String(x.id)===String(editandoId));
     pacientes[idx] = {...pacientes[idx], ...datos};
     await guardarPaciente(pacientes[idx]);
   }else{
+    datos.id = generarIdLocal();
     datos.estado = 'activo';
     datos.ecos = [];
     datos.fecha_registro = new Date().toISOString().slice(0,10);
     datos.origen = 'Registrado en CardioPed';
-    const id = await guardarPaciente(datos);
-    datos.id = id;
+    await guardarPaciente(datos);
     pacientes.push(datos);
   }
   cerrarModal();
@@ -2887,7 +3208,7 @@ $('#form-paciente').addEventListener('submit', async (e)=>{
 /* ---------- ESTADOS: ALTA / FALLECIDO / ELIMINAR / RESTAURAR ---------- */
 async function cambiarEstado(id, estado){
   if(!permisoActual('crear_editar')){ alert('No tienes permiso para realizar esta acción.'); return; }
-  const p = pacientes.find(x=>x.id===id);
+  const p = pacientes.find(x=>String(x.id)===String(id));
   if(!p) return;
   if(estado==='fallecido'){
     const fecha = prompt('Fecha de fallecimiento (AAAA-MM-DD):', new Date().toISOString().slice(0,10));
@@ -2903,7 +3224,8 @@ async function eliminarDefinitivo(id){
   if(!permisoActual('eliminar_definitivo')){ alert('No tienes permiso para realizar esta acción.'); return; }
   if(!confirm('Esto elimina el registro PARA SIEMPRE, sin poder recuperarlo. ¿Continuar?')) return;
   await DB.delete('pacientes', id);
-  pacientes = pacientes.filter(x=>x.id!==id);
+  espejarBorrado('pacientes', id);
+  pacientes = pacientes.filter(x=>String(x.id)!==String(id));
   render();
 }
 
@@ -2924,7 +3246,7 @@ $('#btn-fusionar').addEventListener('click', ()=>{
 });
 let fusionPar = null;
 function abrirModalFusion(id1, id2){
-  const p1 = pacientes.find(x=>x.id===id1), p2 = pacientes.find(x=>x.id===id2);
+  const p1 = pacientes.find(x=>String(x.id)===String(id1)), p2 = pacientes.find(x=>String(x.id)===String(id2));
   fusionPar = {p1, p2};
   const camposFusion = CAMPOS.filter(c=>c.tipo!=='select-medico').map(c=>c.k).concat(['telefono']);
   const cont = $('#cuerpo-fusion');
@@ -2965,7 +3287,7 @@ $('#btn-confirmar-fusion').addEventListener('click', async ()=>{
   p2.fecha_estado = new Date().toISOString().slice(0,10);
   p2.origen = (p2.origen||'') + \` — fusionado con "\${p1.nombre}" (registro #\${p1.id})\`;
   await guardarPaciente(p2);
-  const idx1 = pacientes.findIndex(x=>x.id===p1.id);
+  const idx1 = pacientes.findIndex(x=>String(x.id)===String(p1.id));
   pacientes[idx1] = resultado;
   seleccionFusion.clear();
   actualizarBotonFusion();
@@ -3045,20 +3367,20 @@ function accionesFila(p){
   }
   const puedeEditar = permisoActual('crear_editar');
   const puedeEliminarDef = permisoActual('eliminar_definitivo');
-  let acciones = \`\${puedeEditar?\`<button class="btn btn-gris btn-sm" onclick="abrirModal(\${p.id})">Editar</button>\`:''}
-    <button class="btn btn-primary btn-sm" onclick="abrirEcos(\${p.id})">Eco</button>
-    <button class="btn btn-gris btn-sm" onclick="generarFicha(\${p.id})">Ficha</button>
-    <button class="btn btn-gris btn-sm" onclick="compartirFicha(\${p.id})">Compartir</button>\`;
+  let acciones = \`\${puedeEditar?\`<button class="btn btn-gris btn-sm" onclick="abrirModal('\${p.id}')">Editar</button>\`:''}
+    <button class="btn btn-primary btn-sm" onclick="abrirEcos('\${p.id}')">Eco</button>
+    <button class="btn btn-gris btn-sm" onclick="generarFicha('\${p.id}')">Ficha</button>
+    <button class="btn btn-gris btn-sm" onclick="compartirFicha('\${p.id}')">Compartir</button>\`;
   if(!puedeEditar) return {contacto, acciones};
   if((p.estado||'activo')==='activo'){
-    acciones += \`<button class="btn btn-verde btn-sm" onclick="cambiarEstado(\${p.id},'alta')">Alta</button>
-      <button class="btn btn-rojo btn-sm" onclick="cambiarEstado(\${p.id},'fallecido')">Fallecido</button>
-      <button class="btn btn-rojo btn-sm" onclick="cambiarEstado(\${p.id},'eliminado')">Eliminar</button>\`;
+    acciones += \`<button class="btn btn-verde btn-sm" onclick="cambiarEstado('\${p.id}','alta')">Alta</button>
+      <button class="btn btn-rojo btn-sm" onclick="cambiarEstado('\${p.id}','fallecido')">Fallecido</button>
+      <button class="btn btn-rojo btn-sm" onclick="cambiarEstado('\${p.id}','eliminado')">Eliminar</button>\`;
   }else if(p.estado==='eliminado'){
-    acciones += \`<button class="btn btn-verde btn-sm" onclick="cambiarEstado(\${p.id},'activo')">Restaurar</button>
-      \${puedeEliminarDef?\`<button class="btn btn-rojo btn-sm" onclick="eliminarDefinitivo(\${p.id})">Eliminar definitivo</button>\`:''}\`;
+    acciones += \`<button class="btn btn-verde btn-sm" onclick="cambiarEstado('\${p.id}','activo')">Restaurar</button>
+      \${puedeEliminarDef?\`<button class="btn btn-rojo btn-sm" onclick="eliminarDefinitivo('\${p.id}')">Eliminar definitivo</button>\`:''}\`;
   }else{
-    acciones += \`<button class="btn btn-gris btn-sm" onclick="cambiarEstado(\${p.id},'activo')">Reactivar</button>\`;
+    acciones += \`<button class="btn btn-gris btn-sm" onclick="cambiarEstado('\${p.id}','activo')">Reactivar</button>\`;
   }
   return {contacto, acciones};
 }
@@ -3085,7 +3407,7 @@ function renderTabla(){
     const tr = document.createElement('tr');
     const fotoHtml = p.foto ? \`<img class="foto-mini" src="\${p.foto}">\` : \`<div class="foto-mini vacia">🧒</div>\`;
     tr.innerHTML = \`
-      <td data-label=""><input type="checkbox" class="chk-fusion" data-id="\${p.id}" \${seleccionFusion.has(p.id)?'checked':''}></td>
+      <td data-label=""><input type="checkbox" class="chk-fusion" data-id="\${p.id}" \${seleccionFusion.has(String(p.id))?'checked':''}></td>
       <td data-label="Foto">\${fotoHtml}</td>
       <td data-label="Nombre">\${p.nombre||''}</td>
       <td data-label="Sexo">\${(p.sexo||'').toUpperCase()}</td>
@@ -3099,7 +3421,7 @@ function renderTabla(){
     cuerpo.appendChild(tr);
   });
   $all('.chk-fusion').forEach(chk=>{
-    chk.addEventListener('change', ()=> toggleSeleccionFusion(parseInt(chk.dataset.id,10), chk.checked));
+    chk.addEventListener('change', ()=> toggleSeleccionFusion(chk.dataset.id, chk.checked));
   });
   $('#contador-resultados').textContent = lista.length + (lista.length===1?' paciente':' pacientes');
 }
@@ -3126,7 +3448,7 @@ function textoFicha(p){
   return filas.filter(f=>f[1]).map(f=>\`\${f[0]}: \${f[1]}\`).join('\\n');
 }
 function generarFicha(id){
-  const p = pacientes.find(x=>x.id===id);
+  const p = pacientes.find(x=>String(x.id)===String(id));
   const filas = textoFicha(p).split('\\n').map(l=>{
     const [k,...rest] = l.split(': '); return [k, rest.join(': ')];
   });
@@ -3139,7 +3461,7 @@ function generarFicha(id){
   window.print();
 }
 function compartirFicha(id){
-  const p = pacientes.find(x=>x.id===id);
+  const p = pacientes.find(x=>String(x.id)===String(id));
   const texto = \`Ficha del paciente — CardioPed\\n\\n\${textoFicha(p)}\`;
   if(navigator.share){
     navigator.share({title:'Ficha del paciente', text: texto}).catch(()=>{});
@@ -3157,7 +3479,7 @@ function compartirFicha(id){
 /* ---------- ECOCARDIOGRAMAS ---------- */
 function abrirEcos(id){
   ecoPacienteId = id;
-  const p = pacientes.find(x=>x.id===id);
+  const p = pacientes.find(x=>String(x.id)===String(id));
   $('#ecos-titulo').textContent = 'Ecocardiogramas — ' + p.nombre;
   $('#form-eco-cont').classList.add('oculto');
   $('#btn-nuevo-eco').classList.toggle('oculto', !permisoActual('crear_editar'));
@@ -3168,7 +3490,7 @@ $('#btn-cerrar-ecos').addEventListener('click', ()=>$('#overlay-ecos').classList
 $('#btn-cerrar-ecos2').addEventListener('click', ()=>$('#overlay-ecos').classList.remove('abierto'));
 
 function renderListaEcos(){
-  const p = pacientes.find(x=>x.id===ecoPacienteId);
+  const p = pacientes.find(x=>String(x.id)===String(ecoPacienteId));
   const cont = $('#lista-ecos');
   const ecos = (p.ecos||[]).slice().sort((a,b)=> (b.fecha_eco||'').localeCompare(a.fecha_eco||''));
   if(ecos.length===0){ cont.innerHTML = '<p class="nota">Aún no hay estudios registrados.</p>'; return; }
@@ -3190,13 +3512,13 @@ function renderListaEcos(){
 async function borrarEco(idx){
   if(!permisoActual('crear_editar')){ alert('No tienes permiso para realizar esta acción.'); return; }
   if(!confirm('¿Eliminar este estudio de ecocardiograma?')) return;
-  const p = pacientes.find(x=>x.id===ecoPacienteId);
+  const p = pacientes.find(x=>String(x.id)===String(ecoPacienteId));
   p.ecos.splice(idx,1);
   await guardarPaciente(p);
   renderListaEcos();
 }
 function verEco(idx){
-  const p = pacientes.find(x=>x.id===ecoPacienteId);
+  const p = pacientes.find(x=>String(x.id)===String(ecoPacienteId));
   abrirFormEco(p.ecos[idx], idx);
 }
 $('#btn-nuevo-eco').addEventListener('click', ()=>{
@@ -3237,7 +3559,7 @@ function leerValorCampoEco(c){
   return el ? el.value : '';
 }
 function abrirFormEco(ecoExistente, idx){
-  const p = pacientes.find(x=>x.id===ecoPacienteId);
+  const p = pacientes.find(x=>String(x.id)===String(ecoPacienteId));
   const cont = $('#form-eco-cont');
   let html = \`<form id="form-eco">\`;
   CAMPOS_ECO.forEach(grupo=>{
@@ -3355,14 +3677,15 @@ function renderListaMedicos(){
   cont.innerHTML = medicos.map(m=>\`
     <div style="display:flex; justify-content:space-between; align-items:center; padding:7px 0; border-bottom:1px solid #eee;">
       <div><strong>\${m.nombre}</strong><br><span class="nota">\${m.correo||''}</span></div>
-      <button class="btn btn-rojo btn-sm" onclick="borrarMedico(\${m.id})">Eliminar</button>
+      <button class="btn btn-rojo btn-sm" onclick="borrarMedico('\${m.id}')">Eliminar</button>
     </div>\`).join('');
 }
 async function borrarMedico(id){
   if(!permisoActual('gestionar_medicos')){ alert('No tienes permiso para realizar esta acción.'); return; }
   if(!confirm('¿Eliminar este médico?')) return;
   await DB.delete('medicos', id);
-  medicos = medicos.filter(m=>m.id!==id);
+  espejarBorrado('medicos', id);
+  medicos = medicos.filter(m=>String(m.id)!==String(id));
   renderListaMedicos();
 }
 $('#form-medico').addEventListener('submit', async (e)=>{
@@ -3399,6 +3722,7 @@ function renderTablaReferencias(){
 async function borrarReferenciaCustom(variable){
   if(!permisoActual('gestionar_referencias')){ alert('No tienes permiso para realizar esta acción.'); return; }
   await DB.delete('referencias', variable);
+  espejarBorrado('referencias', variable);
   referenciasCustom = referenciasCustom.filter(r=>r.variable!==variable);
   renderTablaReferencias();
 }
@@ -3470,12 +3794,12 @@ $('#input-importar').addEventListener('change', (e)=>{
         }
       });
       if(!p.nombre) continue;
+      p.id = generarIdLocal();
       p.estado = p.fallecido_original==='Sí' ? 'fallecido' : 'activo';
       p.ecos = [];
       p.fecha_registro = new Date().toISOString().slice(0,10);
       p.origen = p.origen || ('Importado de ' + file.name);
-      const id = await guardarPaciente(p);
-      p.id = id;
+      await guardarPaciente(p);
       pacientes.push(p);
       importados++;
     }
